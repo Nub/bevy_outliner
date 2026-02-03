@@ -92,7 +92,7 @@ OutlineSettings {
 cargo run --example basic
 
 # With egui controls
-cargo run --example with_egui --features bevy_egui
+cargo run --example with_egui
 ```
 
 ## How It Works
