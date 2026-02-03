@@ -17,18 +17,18 @@ use bevy::{
         },
         render_resource::{
             binding_types::{sampler as sampler_layout, texture_2d, texture_storage_2d, uniform_buffer},
-            BindGroupEntries, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-            CachedComputePipelineId, CachedRenderPipelineId, ColorTargetState, ColorWrites,
+            BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+            Buffer, CachedComputePipelineId, CachedRenderPipelineId, ColorTargetState, ColorWrites,
             ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, FragmentState,
             MultisampleState, Operations, PipelineCache, PrimitiveState, RenderPassColorAttachment,
             RenderPassDescriptor, RenderPipelineDescriptor, Sampler, SamplerBindingType,
             SamplerDescriptor, ShaderStages, ShaderType, StorageTextureAccess, TextureDimension,
-            TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor,
+            TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
         },
-        renderer::{RenderContext, RenderDevice},
+        renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
         view::ViewTarget,
-        Extract, RenderApp,
+        Extract, Render, RenderApp,
     },
 };
 
@@ -39,7 +39,7 @@ use crate::silhouette_material::SilhouetteMaterial;
 pub const OUTLINE_RENDER_LAYER: usize = 31;
 
 /// GPU uniform settings for the outline composite shader.
-#[derive(Clone, Copy, Default, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Default, PartialEq, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct OutlineShaderSettings {
     pub color: [f32; 4],
@@ -74,6 +74,24 @@ pub struct ExtractedOutlineData {
     pub settings: OutlineShaderSettings,
 }
 
+/// Cached GPU resources for outline rendering (per-camera)
+/// These are created once and reused each frame to avoid allocation overhead
+#[derive(Component)]
+#[allow(dead_code)] // step_buffers kept alive to maintain bind group validity
+pub struct OutlineRenderResources {
+    pub ping_view: TextureView,
+    pub pong_view: TextureView,
+    pub init_bind_group: BindGroup,
+    pub step_bind_groups: Vec<BindGroup>,
+    pub step_buffers: Vec<Buffer>,
+    pub settings_buffer: Buffer,
+    /// Cached values to detect when resources need recreation
+    pub cached_width: f32,
+    pub cached_texture_size: (u32, u32),
+    /// Cached settings to avoid unnecessary buffer writes
+    pub cached_settings: OutlineShaderSettings,
+}
+
 /// Marker for silhouette cameras
 #[derive(Component)]
 pub struct SilhouetteCamera;
@@ -82,6 +100,12 @@ pub struct SilhouetteCamera;
 #[derive(Component)]
 pub struct SilhouetteMesh {
     pub source: Entity,
+}
+
+/// Marker component added to source entities that have a silhouette mesh spawned
+#[derive(Component)]
+pub struct HasSilhouetteMesh {
+    pub silhouette: Entity,
 }
 
 /// Render label for the outline node
@@ -210,13 +234,18 @@ pub fn setup_outline_camera(
 pub fn sync_outline_meshes(
     mut commands: Commands,
     white_material: Option<Res<SilhouetteWhiteMaterial>>,
+    // Only query entities that don't already have a silhouette spawned
     outlined: Query<
         (Entity, &Mesh3d, &GlobalTransform),
-        (With<MeshOutline>, Without<SilhouetteMesh>),
+        (With<MeshOutline>, Without<HasSilhouetteMesh>),
     >,
     mut silhouettes: Query<(Entity, &SilhouetteMesh, &mut Transform), Without<MeshOutline>>,
-    source_query: Query<(&Mesh3d, &GlobalTransform), With<MeshOutline>>,
+    // Only query sources with changed transforms
+    changed_sources: Query<(Entity, &GlobalTransform), (With<MeshOutline>, Changed<GlobalTransform>)>,
+    // Track entities that had MeshOutline removed
     mut removed: RemovedComponents<MeshOutline>,
+    // Query to get the silhouette entity from source
+    sources_with_silhouettes: Query<(Entity, &HasSilhouetteMesh)>,
 ) {
     let Some(white_material) = white_material else {
         return;
@@ -224,26 +253,51 @@ pub fn sync_outline_meshes(
 
     // Add silhouette meshes for new outlined entities
     for (entity, mesh, global_transform) in outlined.iter() {
-        let transform = Transform::from_matrix(global_transform.to_matrix());
+        let (scale, rotation, translation) = global_transform.to_scale_rotation_translation();
 
-        commands.spawn((
-            SilhouetteMesh { source: entity },
-            Mesh3d(mesh.0.clone()),
-            MeshMaterial3d(white_material.0.clone()),
-            transform,
-            RenderLayers::layer(OUTLINE_RENDER_LAYER),
-        ));
+        let silhouette_entity = commands
+            .spawn((
+                SilhouetteMesh { source: entity },
+                Mesh3d(mesh.0.clone()),
+                MeshMaterial3d(white_material.0.clone()),
+                Transform {
+                    translation,
+                    rotation,
+                    scale,
+                },
+                RenderLayers::layer(OUTLINE_RENDER_LAYER),
+            ))
+            .id();
+
+        // Mark the source entity as having a silhouette
+        commands.entity(entity).insert(HasSilhouetteMesh {
+            silhouette: silhouette_entity,
+        });
     }
 
-    // Update existing silhouette transforms
+    // Update existing silhouette transforms - only when source changed
     for (_sil_entity, silhouette, mut sil_transform) in silhouettes.iter_mut() {
-        if let Ok((_mesh, global_transform)) = source_query.get(silhouette.source) {
-            *sil_transform = Transform::from_matrix(global_transform.to_matrix());
+        // Check if this source's transform changed
+        for (source_entity, global_transform) in changed_sources.iter() {
+            if source_entity == silhouette.source {
+                let (scale, rotation, translation) = global_transform.to_scale_rotation_translation();
+                sil_transform.translation = translation;
+                sil_transform.rotation = rotation;
+                sil_transform.scale = scale;
+                break;
+            }
         }
     }
 
     // Remove silhouette meshes for removed outlines
     for entity in removed.read() {
+        // Find and despawn the silhouette via the HasSilhouetteMesh component
+        if let Ok((_, has_silhouette)) = sources_with_silhouettes.get(entity) {
+            commands.entity(has_silhouette.silhouette).despawn();
+            // Note: HasSilhouetteMesh will be automatically removed since entity still exists
+            // but MeshOutline was removed, which triggers this code path
+        }
+        // Also check by iterating silhouettes (fallback for edge cases)
         for (sil_entity, silhouette, _) in silhouettes.iter() {
             if silhouette.source == entity {
                 commands.entity(sil_entity).despawn();
@@ -375,6 +429,134 @@ pub fn extract_outline_data(
                 enabled: if settings.enabled { 1.0 } else { 0.0 },
                 _padding: [0.0; 2],
             },
+        });
+    }
+}
+
+/// Prepare system that creates/updates cached GPU resources for outline rendering
+pub fn prepare_outline_resources(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    outline_pipeline: Res<OutlinePipeline>,
+    gpu_images: Res<RenderAssets<GpuImage>>,
+    query: Query<(Entity, &ExtractedOutlineData, Option<&OutlineRenderResources>)>,
+) {
+    for (entity, outline_data, existing_resources) in query.iter() {
+        // Get GPU textures
+        let Some(silhouette_gpu) = gpu_images.get(&outline_data.silhouette_texture) else {
+            continue;
+        };
+        let Some(jfa_ping_gpu) = gpu_images.get(&outline_data.jfa_ping_texture) else {
+            continue;
+        };
+        let Some(jfa_pong_gpu) = gpu_images.get(&outline_data.jfa_pong_texture) else {
+            continue;
+        };
+
+        let tex_width = jfa_ping_gpu.texture.width();
+        let tex_height = jfa_ping_gpu.texture.height();
+        let width = outline_data.settings.width;
+
+        // Check if we can reuse existing resources
+        if let Some(existing) = existing_resources {
+            if existing.cached_width == width
+                && existing.cached_texture_size == (tex_width, tex_height)
+            {
+                // Only update settings buffer if settings actually changed
+                if existing.cached_settings != outline_data.settings {
+                    render_queue.write_buffer(
+                        &existing.settings_buffer,
+                        0,
+                        bytemuck::bytes_of(&outline_data.settings),
+                    );
+                }
+                continue;
+            }
+        }
+
+        // Need to create or recreate resources
+        let ping_view = jfa_ping_gpu
+            .texture
+            .create_view(&TextureViewDescriptor::default());
+        let pong_view = jfa_pong_gpu
+            .texture
+            .create_view(&TextureViewDescriptor::default());
+
+        // Calculate pass count
+        let actual_width = width.ceil() as u32;
+        let pass_count = if actual_width > 0 {
+            ((actual_width as f32).log2().ceil() as u32).max(1)
+        } else {
+            0
+        };
+
+        // Create init bind group
+        let init_bind_group = render_device.create_bind_group(
+            "jfa_init_compute_bind_group",
+            &outline_pipeline.init_layout,
+            &BindGroupEntries::sequential((&silhouette_gpu.texture_view, &ping_view)),
+        );
+
+        // Create step buffers and bind groups
+        let mut step_buffers = Vec::with_capacity(pass_count as usize);
+        let mut step_bind_groups = Vec::with_capacity(pass_count as usize);
+
+        for pass_idx in 0..pass_count {
+            let step_size = (actual_width >> (pass_idx + 1)).max(1) as f32;
+            let read_from_ping = pass_idx % 2 == 0;
+
+            let (input_view, output_view) = if read_from_ping {
+                (&ping_view, &pong_view)
+            } else {
+                (&pong_view, &ping_view)
+            };
+
+            let step_buffer = render_device.create_buffer_with_data(
+                &bevy::render::render_resource::BufferInitDescriptor {
+                    label: Some("jfa_step_params_buffer"),
+                    contents: bytemuck::bytes_of(&JfaStepParams {
+                        step_size,
+                        _padding: [0.0; 3],
+                    }),
+                    usage: bevy::render::render_resource::BufferUsages::UNIFORM,
+                },
+            );
+
+            let step_bind_group = render_device.create_bind_group(
+                "jfa_step_compute_bind_group",
+                &outline_pipeline.step_layout,
+                &BindGroupEntries::sequential((
+                    input_view,
+                    output_view,
+                    step_buffer.as_entire_binding(),
+                )),
+            );
+
+            step_buffers.push(step_buffer);
+            step_bind_groups.push(step_bind_group);
+        }
+
+        // Create settings buffer
+        let settings_buffer = render_device.create_buffer_with_data(
+            &bevy::render::render_resource::BufferInitDescriptor {
+                label: Some("outline_settings_buffer"),
+                contents: bytemuck::bytes_of(&outline_data.settings),
+                usage: bevy::render::render_resource::BufferUsages::UNIFORM
+                    | bevy::render::render_resource::BufferUsages::COPY_DST,
+            },
+        );
+
+        commands.entity(entity).insert(OutlineRenderResources {
+            ping_view,
+            pong_view,
+            init_bind_group,
+            step_bind_groups,
+            step_buffers,
+            settings_buffer,
+            cached_width: width,
+            cached_texture_size: (tex_width, tex_height),
+            cached_settings: outline_data.settings,
         });
     }
 }
@@ -576,21 +758,30 @@ impl FromWorld for OutlinePipeline {
     }
 }
 
-/// The outline render node - runs dilation, JFA passes, and composites the result
+/// The outline render node - runs JFA passes and composites the result
+/// Uses cached resources from OutlineRenderResources to avoid per-frame allocations
 #[derive(Default)]
 pub struct OutlineNode;
 
 impl ViewNode for OutlineNode {
-    type ViewQuery = (&'static ViewTarget, Option<&'static ExtractedOutlineData>);
+    type ViewQuery = (
+        &'static ViewTarget,
+        Option<&'static ExtractedOutlineData>,
+        Option<&'static OutlineRenderResources>,
+    );
 
     fn run<'w>(
         &self,
         _graph: &mut RenderGraphContext,
         render_context: &mut RenderContext<'w>,
-        (view_target, outline_data): bevy::ecs::query::QueryItem<'w, '_, Self::ViewQuery>,
+        (view_target, outline_data, render_resources): bevy::ecs::query::QueryItem<'w, '_, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), NodeRunError> {
         let Some(outline_data) = outline_data else {
+            return Ok(());
+        };
+        let Some(render_resources) = render_resources else {
+            // Resources not yet prepared, skip this frame
             return Ok(());
         };
 
@@ -598,14 +789,11 @@ impl ViewNode for OutlineNode {
         let pipeline_cache = world.resource::<PipelineCache>();
         let gpu_images = world.resource::<RenderAssets<GpuImage>>();
 
-        // Get all required textures
+        // Get silhouette texture for composite pass
         let Some(silhouette_gpu) = gpu_images.get(&outline_data.silhouette_texture) else {
             return Ok(());
         };
         let Some(jfa_ping_gpu) = gpu_images.get(&outline_data.jfa_ping_texture) else {
-            return Ok(());
-        };
-        let Some(jfa_pong_gpu) = gpu_images.get(&outline_data.jfa_pong_texture) else {
             return Ok(());
         };
 
@@ -626,83 +814,7 @@ impl ViewNode for OutlineNode {
             return Ok(());
         };
 
-        // Create texture views
-        let ping_view = jfa_ping_gpu.texture.create_view(&TextureViewDescriptor::default());
-        let pong_view = jfa_pong_gpu.texture.create_view(&TextureViewDescriptor::default());
-
-        // Calculate pass count based on actual outline width
-        // A 5px outline needs ceil(log2(5)) = 3 passes
-        let actual_width = outline_data.settings.width.ceil() as u32;
-        let pass_count = if actual_width > 0 {
-            ((actual_width as f32).log2().ceil() as u32).max(1)
-        } else {
-            0
-        };
-
-        // ========== Create bind groups ==========
-        let init_bind_group;
-        let mut step_bind_groups = Vec::with_capacity(pass_count as usize);
-        let settings_buffer;
-
-        {
-            let render_device = render_context.render_device();
-
-            // Init compute bind group: silhouette (read), output (write)
-            init_bind_group = render_device.create_bind_group(
-                "jfa_init_compute_bind_group",
-                &outline_pipeline.init_layout,
-                &BindGroupEntries::sequential((
-                    &silhouette_gpu.texture_view,
-                    &ping_view,
-                )),
-            );
-
-            // Step compute bind groups
-            for pass_idx in 0..pass_count {
-                let step_size = (actual_width >> (pass_idx + 1)).max(1) as f32;
-                let read_from_ping = pass_idx % 2 == 0;
-
-                let (input_view, output_view) = if read_from_ping {
-                    (&ping_view, &pong_view)
-                } else {
-                    (&pong_view, &ping_view)
-                };
-
-                let step_params_buffer = render_device.create_buffer_with_data(
-                    &bevy::render::render_resource::BufferInitDescriptor {
-                        label: Some("jfa_step_params_buffer"),
-                        contents: bytemuck::bytes_of(&JfaStepParams {
-                            step_size,
-                            _padding: [0.0; 3],
-                        }),
-                        usage: bevy::render::render_resource::BufferUsages::UNIFORM,
-                    },
-                );
-
-                let step_bind_group = render_device.create_bind_group(
-                    "jfa_step_compute_bind_group",
-                    &outline_pipeline.step_layout,
-                    &BindGroupEntries::sequential((
-                        input_view,
-                        output_view,
-                        step_params_buffer.as_entire_binding(),
-                    )),
-                );
-
-                step_bind_groups.push(step_bind_group);
-            }
-
-            // Settings buffer for composite
-            settings_buffer = render_device.create_buffer_with_data(
-                &bevy::render::render_resource::BufferInitDescriptor {
-                    label: Some("outline_settings_buffer"),
-                    contents: bytemuck::bytes_of(&outline_data.settings),
-                    usage: bevy::render::render_resource::BufferUsages::UNIFORM,
-                },
-            );
-        }
-
-        // ========== Run compute passes ==========
+        // ========== Run compute passes using cached resources ==========
 
         // Calculate workgroup count (8x8 workgroups)
         let tex_width = jfa_ping_gpu.texture.width();
@@ -721,12 +833,12 @@ impl ViewNode for OutlineNode {
                     });
 
             compute_pass.set_pipeline(init_pipeline);
-            compute_pass.set_bind_group(0, &init_bind_group, &[]);
+            compute_pass.set_bind_group(0, &render_resources.init_bind_group, &[]);
             compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
         // JFA Step Compute Passes: Propagate seeds with decreasing step sizes
-        for step_bind_group in &step_bind_groups {
+        for step_bind_group in &render_resources.step_bind_groups {
             let mut compute_pass =
                 render_context
                     .command_encoder()
@@ -741,13 +853,15 @@ impl ViewNode for OutlineNode {
         }
 
         // Determine which texture has the final JFA result
+        let pass_count = render_resources.step_bind_groups.len();
         let jfa_result_view = if pass_count % 2 == 0 {
-            &ping_view
+            &render_resources.ping_view
         } else {
-            &pong_view
+            &render_resources.pong_view
         };
 
         // Composite Pass: Blend outline over scene using JFA distance field
+        // Note: composite_bind_group must be created each frame because post_process.source changes
         {
             let post_process = view_target.post_process_write();
 
@@ -761,7 +875,7 @@ impl ViewNode for OutlineNode {
                     &outline_pipeline.sampler,
                     &silhouette_gpu.texture_view,
                     &outline_pipeline.sampler,
-                    settings_buffer.as_entire_binding(),
+                    render_resources.settings_buffer.as_entire_binding(),
                 )),
             );
 
@@ -798,6 +912,7 @@ impl Plugin for OutlineRenderPlugin {
 
         render_app
             .add_systems(ExtractSchedule, extract_outline_data)
+            .add_systems(Render, prepare_outline_resources)
             .add_render_graph_node::<ViewNodeRunner<OutlineNode>>(Core3d, OutlineNodeLabel)
             .add_render_graph_edges(
                 Core3d,
