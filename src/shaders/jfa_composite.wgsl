@@ -27,30 +27,27 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         return scene_color;
     }
 
-    // Check if we're inside the object (no outline on object surface)
+    // Check JFA first - most pixels have no valid seed (cheaper than silhouette sample)
+    let seed_uv = textureSample(jfa_texture, jfa_sampler, in.uv).xy;
+    if seed_uv.x < 0.0 {
+        return scene_color;
+    }
+
+    // Calculate distance and early-out if beyond outline width
+    let tex_size = vec2<f32>(textureDimensions(jfa_texture));
+    let diff = (in.uv - seed_uv) * tex_size;
+    let dist = length(diff);
+    if dist > settings.width {
+        return scene_color;
+    }
+
+    // Only sample silhouette for pixels potentially in the outline
     let silhouette = textureSample(silhouette_texture, silhouette_sampler, in.uv).a;
     if silhouette > 0.5 {
         return scene_color;
     }
 
-    // Read nearest seed UV from JFA result
-    let seed_uv = textureSample(jfa_texture, jfa_sampler, in.uv).xy;
-
-    // Check if we found a valid seed
-    if seed_uv.x < 0.0 {
-        return scene_color;
-    }
-
-    // Calculate distance in pixels
-    let tex_size = vec2<f32>(textureDimensions(jfa_texture));
-    let diff = (in.uv - seed_uv) * tex_size;
-    let dist = length(diff);
-
-    // Create smooth outline based on distance
-    // 1-pixel smooth falloff at the outer edge for anti-aliasing
-    let width = settings.width;
-    let outline_strength = 1.0 - smoothstep(width - 1.0, width, dist);
-
-    // Composite outline over scene
+    // Smooth outline with 1-pixel AA falloff
+    let outline_strength = 1.0 - smoothstep(settings.width - 1.0, settings.width, dist);
     return mix(scene_color, settings.color, outline_strength * settings.color.a);
 }

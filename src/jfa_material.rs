@@ -346,23 +346,24 @@ pub fn extract_outline_data(
     outlines: Extract<Query<&MeshOutline>>,
     render_entity_lookup: Extract<Query<&bevy::render::sync_world::RenderEntity>>,
 ) {
+    // Early exit if no outlined entities - skip all rendering
+    let Some(first_outline) = outlines.iter().next() else {
+        return;
+    };
+
+    let color = [
+        first_outline.color.red,
+        first_outline.color.green,
+        first_outline.color.blue,
+        first_outline.color.alpha,
+    ];
+    let width = first_outline.width;
+
     for (entity, link, settings) in cameras.iter() {
         // Get the render entity for this camera
         let Ok(render_entity) = render_entity_lookup.get(entity) else {
             continue;
         };
-
-        // Get the first outline's color/width for now (could aggregate later)
-        let (color, width) = outlines
-            .iter()
-            .next()
-            .map(|o| {
-                (
-                    [o.color.red, o.color.green, o.color.blue, o.color.alpha],
-                    o.width,
-                )
-            })
-            .unwrap_or(([1.0, 0.5, 0.0, 1.0], 5.0));
 
         commands.entity(render_entity.id()).insert(ExtractedOutlineData {
             silhouette_texture: link.silhouette_texture.clone(),
@@ -652,7 +653,7 @@ impl ViewNode for OutlineNode {
                 &outline_pipeline.init_layout,
                 &BindGroupEntries::sequential((
                     &silhouette_gpu.texture_view,
-                    &ping_view, // Output to JFA ping texture
+                    &ping_view,
                 )),
             );
 
@@ -683,7 +684,7 @@ impl ViewNode for OutlineNode {
                     &outline_pipeline.step_layout,
                     &BindGroupEntries::sequential((
                         input_view,
-                        output_view, // Output storage texture
+                        output_view,
                         step_params_buffer.as_entire_binding(),
                     )),
                 );
@@ -709,7 +710,7 @@ impl ViewNode for OutlineNode {
         let workgroups_x = (tex_width + 7) / 8;
         let workgroups_y = (tex_height + 7) / 8;
 
-        // Init Compute Pass: Convert silhouette to seed coordinates (masked)
+        // Init Compute Pass: Convert silhouette to seed coordinates
         {
             let mut compute_pass =
                 render_context
@@ -724,7 +725,7 @@ impl ViewNode for OutlineNode {
             compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
-        // JFA Step Compute Passes: Propagate seeds with decreasing step sizes (masked)
+        // JFA Step Compute Passes: Propagate seeds with decreasing step sizes
         for step_bind_group in &step_bind_groups {
             let mut compute_pass =
                 render_context
