@@ -65,6 +65,8 @@ impl Plugin for OutlinePlugin {
         // Embed shaders
         embedded_asset!(app, "shaders/jfa_init.wgsl");
         embedded_asset!(app, "shaders/jfa_step.wgsl");
+        embedded_asset!(app, "shaders/jfa_init_compute.wgsl");
+        embedded_asset!(app, "shaders/jfa_step_compute.wgsl");
         embedded_asset!(app, "shaders/jfa_dilate.wgsl");
         embedded_asset!(app, "shaders/jfa_composite.wgsl");
         embedded_asset!(app, "shaders/silhouette.wgsl");
