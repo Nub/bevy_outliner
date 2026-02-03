@@ -51,7 +51,8 @@ pub use components::*;
 use bevy::{asset::embedded_asset, prelude::*};
 
 use jfa_material::{
-    setup_outline_camera, sync_outline_meshes, sync_silhouette_cameras, OutlineRenderPlugin,
+    resize_silhouette_textures, setup_outline_camera, sync_outline_meshes, sync_silhouette_cameras,
+    OutlineRenderPlugin,
 };
 
 /// Plugin that enables silhouette-based object outlining.
@@ -68,6 +69,7 @@ impl Plugin for OutlinePlugin {
                 setup_outline_camera,
                 sync_outline_meshes,
                 sync_silhouette_cameras,
+                resize_silhouette_textures,
             )
                 .chain(),
         );

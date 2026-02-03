@@ -226,6 +226,62 @@ pub fn sync_silhouette_cameras(
     }
 }
 
+/// Resizes silhouette textures when the window size changes
+pub fn resize_silhouette_textures(
+    mut images: ResMut<Assets<Image>>,
+    cameras: Query<(Option<&RenderTarget>, &OutlineCameraLink), With<OutlineSettings>>,
+    windows: Query<&Window>,
+) {
+    for (render_target, link) in cameras.iter() {
+        // Get current window size
+        let target_size = match render_target {
+            Some(RenderTarget::Window(window_ref)) => {
+                let window = match window_ref {
+                    bevy::window::WindowRef::Primary => windows.iter().next(),
+                    bevy::window::WindowRef::Entity(e) => windows.get(*e).ok(),
+                };
+                window.map(|w| UVec2::new(w.physical_width(), w.physical_height()))
+            }
+            Some(RenderTarget::Image(image_target)) => {
+                images.get(&image_target.handle).map(|img| img.size())
+            }
+            _ => windows
+                .iter()
+                .next()
+                .map(|w| UVec2::new(w.physical_width(), w.physical_height())),
+        };
+
+        let Some(target_size) = target_size else {
+            continue;
+        };
+
+        // Skip if size is zero
+        if target_size.x == 0 || target_size.y == 0 {
+            continue;
+        }
+
+        // Check current silhouette texture size
+        let Some(silhouette_image) = images.get(&link.silhouette_texture) else {
+            continue;
+        };
+
+        let current_size = silhouette_image.size();
+
+        // Resize if dimensions don't match
+        if current_size != target_size {
+            let Some(silhouette_image) = images.get_mut(&link.silhouette_texture) else {
+                continue;
+            };
+
+            silhouette_image.resize(Extent3d {
+                width: target_size.x,
+                height: target_size.y,
+                depth_or_array_layers: 1,
+            });
+        }
+    }
+}
+
 /// Extract outline data to render world
 pub fn extract_outline_data(
     mut commands: Commands,
