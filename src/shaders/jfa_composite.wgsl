@@ -28,8 +28,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Check JFA first - most pixels have no valid seed (cheaper than silhouette sample)
+    // With rg16unorm format, invalid seeds are (0, 0) since valid UVs are at pixel centers
     let seed_uv = textureSample(jfa_texture, jfa_sampler, in.uv).xy;
-    if seed_uv.x < 0.0 {
+    if seed_uv.x <= 0.0 {
         return scene_color;
     }
 

@@ -98,9 +98,7 @@ pub struct SilhouetteCamera;
 
 /// Marker for silhouette mesh copies
 #[derive(Component)]
-pub struct SilhouetteMesh {
-    pub source: Entity,
-}
+pub struct SilhouetteMesh;
 
 /// Marker component added to source entities that have a silhouette mesh spawned
 #[derive(Component)]
@@ -175,11 +173,12 @@ pub fn setup_outline_camera(
         };
 
         // JFA textures need STORAGE_BINDING for compute shaders
+        // Using Rg16Unorm instead of Rg16Float - sufficient for UV coords in [0,1] range
         let mut jfa_ping_image = Image::new_fill(
             jfa_extent,
             TextureDimension::D2,
-            &[0; 8], // 2 x f16 = 4 bytes, but new_fill expects 8 for Rg16Float
-            TextureFormat::Rg16Float,
+            &[0; 4], // 2 x u16 = 4 bytes
+            TextureFormat::Rg16Unorm,
             RenderAssetUsages::RENDER_WORLD,
         );
         jfa_ping_image.texture_descriptor.usage =
@@ -189,8 +188,8 @@ pub fn setup_outline_camera(
         let mut jfa_pong_image = Image::new_fill(
             jfa_extent,
             TextureDimension::D2,
-            &[0; 8],
-            TextureFormat::Rg16Float,
+            &[0; 4],
+            TextureFormat::Rg16Unorm,
             RenderAssetUsages::RENDER_WORLD,
         );
         jfa_pong_image.texture_descriptor.usage =
@@ -239,7 +238,7 @@ pub fn sync_outline_meshes(
         (Entity, &Mesh3d, &GlobalTransform),
         (With<MeshOutline>, Without<HasSilhouetteMesh>),
     >,
-    mut silhouettes: Query<(Entity, &SilhouetteMesh, &mut Transform), Without<MeshOutline>>,
+    mut silhouettes: Query<(Entity, &mut Transform), (With<SilhouetteMesh>, Without<MeshOutline>)>,
     // Only query sources with changed transforms
     changed_sources: Query<(Entity, &GlobalTransform), (With<MeshOutline>, Changed<GlobalTransform>)>,
     // Track entities that had MeshOutline removed
@@ -257,7 +256,7 @@ pub fn sync_outline_meshes(
 
         let silhouette_entity = commands
             .spawn((
-                SilhouetteMesh { source: entity },
+                SilhouetteMesh,
                 Mesh3d(mesh.0.clone()),
                 MeshMaterial3d(white_material.0.clone()),
                 Transform {
@@ -275,33 +274,22 @@ pub fn sync_outline_meshes(
         });
     }
 
-    // Update existing silhouette transforms - only when source changed
-    for (_sil_entity, silhouette, mut sil_transform) in silhouettes.iter_mut() {
-        // Check if this source's transform changed
-        for (source_entity, global_transform) in changed_sources.iter() {
-            if source_entity == silhouette.source {
+    // Update silhouette transforms - O(n) by iterating changed sources directly
+    for (source_entity, global_transform) in changed_sources.iter() {
+        if let Ok((_, has_silhouette)) = sources_with_silhouettes.get(source_entity) {
+            if let Ok((_, mut sil_transform)) = silhouettes.get_mut(has_silhouette.silhouette) {
                 let (scale, rotation, translation) = global_transform.to_scale_rotation_translation();
                 sil_transform.translation = translation;
                 sil_transform.rotation = rotation;
                 sil_transform.scale = scale;
-                break;
             }
         }
     }
 
     // Remove silhouette meshes for removed outlines
     for entity in removed.read() {
-        // Find and despawn the silhouette via the HasSilhouetteMesh component
         if let Ok((_, has_silhouette)) = sources_with_silhouettes.get(entity) {
             commands.entity(has_silhouette.silhouette).despawn();
-            // Note: HasSilhouetteMesh will be automatically removed since entity still exists
-            // but MeshOutline was removed, which triggers this code path
-        }
-        // Also check by iterating silhouettes (fallback for edge cases)
-        for (sil_entity, silhouette, _) in silhouettes.iter() {
-            if silhouette.source == entity {
-                commands.entity(sil_entity).despawn();
-            }
         }
     }
 }
@@ -604,7 +592,7 @@ impl FromWorld for OutlinePipeline {
                 // Silhouette texture (read)
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 // Output texture (write)
-                texture_storage_2d(TextureFormat::Rg16Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rg16Unorm, StorageTextureAccess::WriteOnly),
             ),
         );
 
@@ -636,7 +624,7 @@ impl FromWorld for OutlinePipeline {
                 // JFA input texture (read)
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 // Output texture (write)
-                texture_storage_2d(TextureFormat::Rg16Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rg16Unorm, StorageTextureAccess::WriteOnly),
                 // Step params uniform
                 uniform_buffer::<JfaStepParams>(false),
             ),

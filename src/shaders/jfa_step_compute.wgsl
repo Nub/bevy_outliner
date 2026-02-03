@@ -3,7 +3,7 @@
 // Samples 9 neighbors at step_size offset and propagates closest seed
 
 @group(0) @binding(0) var input_texture: texture_2d<f32>;
-@group(0) @binding(1) var output_texture: texture_storage_2d<rg16float, write>;
+@group(0) @binding(1) var output_texture: texture_storage_2d<rg16unorm, write>;
 
 struct JfaParams {
     step_size: f32,
@@ -14,11 +14,12 @@ struct JfaParams {
 
 @group(0) @binding(2) var<uniform> params: JfaParams;
 
-const INVALID_SEED: vec2<f32> = vec2<f32>(-1.0, -1.0);
+// Invalid seed marker - 0.0 works since valid UVs are at pixel centers (always > 0)
+const INVALID_SEED: vec2<f32> = vec2<f32>(0.0, 0.0);
 
-// Check if a seed coordinate is valid
+// Check if a seed coordinate is valid (valid UVs are at pixel centers, always > 0)
 fn is_valid_seed(seed: vec2<f32>) -> bool {
-    return seed.x >= 0.0;
+    return seed.x > 0.0;
 }
 
 // Calculate squared distance from pixel UV to seed UV (in pixel space)
