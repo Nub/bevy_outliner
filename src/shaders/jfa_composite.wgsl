@@ -112,8 +112,8 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let width = settings.width;
 
     // Outline is drawn where distance is within the width
-    // Smooth falloff at the edges for anti-aliasing
-    let outline_strength = 1.0 - smoothstep(width - 1.0, width + 0.5, dist);
+    // 1-pixel smooth falloff at the outer edge for anti-aliasing
+    let outline_strength = 1.0 - smoothstep(width - 1.0, width, dist);
 
     // Only show outline outside the object
     let center = sample_silhouette(in.uv);
