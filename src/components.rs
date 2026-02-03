@@ -53,30 +53,13 @@ impl MeshOutline {
 #[derive(Component, Clone, Copy, ExtractComponent, Reflect)]
 #[reflect(Component)]
 pub struct OutlineSettings {
-    /// Maximum outline width supported (affects JFA pass count).
-    /// Higher values require more passes but support wider outlines.
-    /// Default is 64 pixels.
-    pub max_width: u32,
     /// Whether outline rendering is enabled.
     pub enabled: bool,
 }
 
 impl Default for OutlineSettings {
     fn default() -> Self {
-        Self {
-            max_width: 64,
-            enabled: true,
-        }
-    }
-}
-
-impl OutlineSettings {
-    /// Calculate the number of JFA passes needed for the configured max width.
-    pub fn jfa_pass_count(&self) -> u32 {
-        if self.max_width == 0 {
-            return 0;
-        }
-        ((self.max_width as f32).log2().ceil() as u32).max(1)
+        Self { enabled: true }
     }
 }
 

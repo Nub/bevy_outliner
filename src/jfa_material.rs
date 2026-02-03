@@ -56,15 +56,6 @@ pub struct JfaStepParams {
     pub _padding: [f32; 3],
 }
 
-/// GPU uniform for dilation pass
-#[derive(Clone, Copy, Default, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct DilateParams {
-    pub max_width: f32,
-    pub is_vertical: f32,
-    pub _padding: [f32; 2],
-}
-
 /// Links the main camera to its silhouette camera and textures
 #[derive(Component, Clone)]
 pub struct OutlineCameraLink {
@@ -72,8 +63,6 @@ pub struct OutlineCameraLink {
     pub silhouette_texture: Handle<Image>,
     pub jfa_ping_texture: Handle<Image>,
     pub jfa_pong_texture: Handle<Image>,
-    pub mask_ping_texture: Handle<Image>,
-    pub mask_pong_texture: Handle<Image>,
 }
 
 /// Extracted outline data for render world
@@ -82,10 +71,7 @@ pub struct ExtractedOutlineData {
     pub silhouette_texture: Handle<Image>,
     pub jfa_ping_texture: Handle<Image>,
     pub jfa_pong_texture: Handle<Image>,
-    pub mask_ping_texture: Handle<Image>,
-    pub mask_pong_texture: Handle<Image>,
     pub settings: OutlineShaderSettings,
-    pub max_width: u32,
 }
 
 /// Marker for silhouette cameras
@@ -187,29 +173,6 @@ pub fn setup_outline_camera(
             TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING;
         let jfa_pong_handle = images.add(jfa_pong_image);
 
-        // Create mask ping-pong textures for dilation (R8 format for efficiency)
-        let mut mask_ping_image = Image::new_fill(
-            jfa_extent,
-            TextureDimension::D2,
-            &[0],
-            TextureFormat::R8Unorm,
-            RenderAssetUsages::RENDER_WORLD,
-        );
-        mask_ping_image.texture_descriptor.usage =
-            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
-        let mask_ping_handle = images.add(mask_ping_image);
-
-        let mut mask_pong_image = Image::new_fill(
-            jfa_extent,
-            TextureDimension::D2,
-            &[0],
-            TextureFormat::R8Unorm,
-            RenderAssetUsages::RENDER_WORLD,
-        );
-        mask_pong_image.texture_descriptor.usage =
-            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
-        let mask_pong_handle = images.add(mask_pong_image);
-
         // Create silhouette material (minimal shader, no PBR)
         let white_material = materials.add(SilhouetteMaterial::default());
 
@@ -239,8 +202,6 @@ pub fn setup_outline_camera(
             silhouette_texture: silhouette_handle,
             jfa_ping_texture: jfa_ping_handle,
             jfa_pong_texture: jfa_pong_handle,
-            mask_ping_texture: mask_ping_handle,
-            mask_pong_texture: mask_pong_handle,
         });
     }
 }
@@ -375,24 +336,6 @@ pub fn resize_silhouette_textures(
                 }
             }
         }
-
-        // Resize mask ping texture
-        if let Some(mask_ping_image) = images.get(&link.mask_ping_texture) {
-            if mask_ping_image.size() != target_size {
-                if let Some(img) = images.get_mut(&link.mask_ping_texture) {
-                    img.resize(extent);
-                }
-            }
-        }
-
-        // Resize mask pong texture
-        if let Some(mask_pong_image) = images.get(&link.mask_pong_texture) {
-            if mask_pong_image.size() != target_size {
-                if let Some(img) = images.get_mut(&link.mask_pong_texture) {
-                    img.resize(extent);
-                }
-            }
-        }
     }
 }
 
@@ -425,15 +368,12 @@ pub fn extract_outline_data(
             silhouette_texture: link.silhouette_texture.clone(),
             jfa_ping_texture: link.jfa_ping_texture.clone(),
             jfa_pong_texture: link.jfa_pong_texture.clone(),
-            mask_ping_texture: link.mask_ping_texture.clone(),
-            mask_pong_texture: link.mask_pong_texture.clone(),
             settings: OutlineShaderSettings {
                 color,
                 width,
                 enabled: if settings.enabled { 1.0 } else { 0.0 },
                 _padding: [0.0; 2],
             },
-            max_width: settings.max_width,
         });
     }
 }
@@ -441,10 +381,6 @@ pub fn extract_outline_data(
 /// Pipeline resource for outline rendering
 #[derive(Resource)]
 pub struct OutlinePipeline {
-    // Dilation pass (creates mask for region of interest) - still uses fragment shader
-    pub dilate_layout: BindGroupLayout,
-    pub dilate_pipeline_id: CachedRenderPipelineId,
-
     // Init pass - COMPUTE shader
     pub init_layout: BindGroupLayout,
     pub init_pipeline_id: CachedComputePipelineId,
@@ -453,7 +389,7 @@ pub struct OutlinePipeline {
     pub step_layout: BindGroupLayout,
     pub step_pipeline_id: CachedComputePipelineId,
 
-    // Composite pass - still uses fragment shader
+    // Composite pass - fragment shader
     pub composite_layout: BindGroupLayout,
     pub composite_pipeline_id: CachedRenderPipelineId,
     pub composite_pipeline_id_hdr: CachedRenderPipelineId,
@@ -472,56 +408,8 @@ impl FromWorld for OutlinePipeline {
         // Shaders
         let vertex_shader = asset_server
             .load("embedded://bevy_core_pipeline/fullscreen_vertex_shader/fullscreen.wgsl");
-        let dilate_shader = asset_server.load("embedded://bevy_outliner/shaders/jfa_dilate.wgsl");
         let composite_shader =
             asset_server.load("embedded://bevy_outliner/shaders/jfa_composite.wgsl");
-
-        // ========== Dilate Pipeline ==========
-        let dilate_layout_entries = BindGroupLayoutEntries::sequential(
-            ShaderStages::FRAGMENT,
-            (
-                // Input texture (silhouette.a for horizontal, mask for vertical)
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                // Input sampler
-                sampler_layout(SamplerBindingType::Filtering),
-                // Dilate params uniform
-                uniform_buffer::<DilateParams>(false),
-            ),
-        );
-
-        let dilate_layout = render_device.create_bind_group_layout(
-            Some("jfa_dilate_bind_group_layout"),
-            &dilate_layout_entries,
-        );
-
-        let dilate_pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-            label: Some("jfa_dilate_pipeline".into()),
-            layout: vec![BindGroupLayoutDescriptor::new(
-                "jfa_dilate_bind_group_layout",
-                &dilate_layout_entries,
-            )],
-            vertex: bevy::render::render_resource::VertexState {
-                shader: vertex_shader.clone(),
-                shader_defs: vec![],
-                entry_point: Some("fullscreen_vertex_shader".into()),
-                buffers: vec![],
-            },
-            fragment: Some(FragmentState {
-                shader: dilate_shader,
-                shader_defs: vec![],
-                entry_point: Some("fragment".into()),
-                targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::R8Unorm,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            primitive: PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            push_constant_ranges: vec![],
-            zero_initialize_workgroup_memory: false,
-        });
 
         // ========== Init Compute Pipeline ==========
         let init_compute_shader =
@@ -531,8 +419,6 @@ impl FromWorld for OutlinePipeline {
             ShaderStages::COMPUTE,
             (
                 // Silhouette texture (read)
-                texture_2d(TextureSampleType::Float { filterable: false }),
-                // Mask texture (read)
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 // Output texture (write)
                 texture_storage_2d(TextureFormat::Rg16Float, StorageTextureAccess::WriteOnly),
@@ -565,8 +451,6 @@ impl FromWorld for OutlinePipeline {
             ShaderStages::COMPUTE,
             (
                 // JFA input texture (read)
-                texture_2d(TextureSampleType::Float { filterable: false }),
-                // Mask texture (read)
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 // Output texture (write)
                 texture_storage_2d(TextureFormat::Rg16Float, StorageTextureAccess::WriteOnly),
@@ -679,8 +563,6 @@ impl FromWorld for OutlinePipeline {
             });
 
         Self {
-            dilate_layout,
-            dilate_pipeline_id,
             init_layout,
             init_pipeline_id,
             step_layout,
@@ -725,17 +607,8 @@ impl ViewNode for OutlineNode {
         let Some(jfa_pong_gpu) = gpu_images.get(&outline_data.jfa_pong_texture) else {
             return Ok(());
         };
-        let Some(mask_ping_gpu) = gpu_images.get(&outline_data.mask_ping_texture) else {
-            return Ok(());
-        };
-        let Some(mask_pong_gpu) = gpu_images.get(&outline_data.mask_pong_texture) else {
-            return Ok(());
-        };
 
-        // Get pipelines
-        let Some(dilate_pipeline) = pipeline_cache.get_render_pipeline(outline_pipeline.dilate_pipeline_id) else {
-            return Ok(());
-        };
+        // Get compute pipelines
         let Some(init_pipeline) = pipeline_cache.get_compute_pipeline(outline_pipeline.init_pipeline_id) else {
             return Ok(());
         };
@@ -755,12 +628,9 @@ impl ViewNode for OutlineNode {
         // Create texture views
         let ping_view = jfa_ping_gpu.texture.create_view(&TextureViewDescriptor::default());
         let pong_view = jfa_pong_gpu.texture.create_view(&TextureViewDescriptor::default());
-        let mask_ping_view = mask_ping_gpu.texture.create_view(&TextureViewDescriptor::default());
-        let mask_pong_view = mask_pong_gpu.texture.create_view(&TextureViewDescriptor::default());
 
-        // Calculate pass count based on ACTUAL outline width (not max_width)
-        // This is the key optimization - smaller outlines need fewer JFA passes
-        // A 5px outline needs ceil(log2(5)) = 3 passes vs 7 for 64px max_width
+        // Calculate pass count based on actual outline width
+        // A 5px outline needs ceil(log2(5)) = 3 passes
         let actual_width = outline_data.settings.width.ceil() as u32;
         let pass_count = if actual_width > 0 {
             ((actual_width as f32).log2().ceil() as u32).max(1)
@@ -768,9 +638,7 @@ impl ViewNode for OutlineNode {
             0
         };
 
-        // ========== Phase 1: Create all resources upfront ==========
-        let dilate_h_bind_group;
-        let dilate_v_bind_group;
+        // ========== Create bind groups ==========
         let init_bind_group;
         let mut step_bind_groups = Vec::with_capacity(pass_count as usize);
         let settings_buffer;
@@ -778,62 +646,17 @@ impl ViewNode for OutlineNode {
         {
             let render_device = render_context.render_device();
 
-            // Dilate horizontal: silhouette.a -> mask_ping
-            let dilate_h_params = render_device.create_buffer_with_data(
-                &bevy::render::render_resource::BufferInitDescriptor {
-                    label: Some("dilate_h_params_buffer"),
-                    contents: bytemuck::bytes_of(&DilateParams {
-                        max_width: outline_data.max_width as f32,
-                        is_vertical: 0.0,
-                        _padding: [0.0; 2],
-                    }),
-                    usage: bevy::render::render_resource::BufferUsages::UNIFORM,
-                },
-            );
-            dilate_h_bind_group = render_device.create_bind_group(
-                "jfa_dilate_h_bind_group",
-                &outline_pipeline.dilate_layout,
-                &BindGroupEntries::sequential((
-                    &silhouette_gpu.texture_view,
-                    &outline_pipeline.sampler,
-                    dilate_h_params.as_entire_binding(),
-                )),
-            );
-
-            // Dilate vertical: mask_ping -> mask_pong
-            let dilate_v_params = render_device.create_buffer_with_data(
-                &bevy::render::render_resource::BufferInitDescriptor {
-                    label: Some("dilate_v_params_buffer"),
-                    contents: bytemuck::bytes_of(&DilateParams {
-                        max_width: outline_data.max_width as f32,
-                        is_vertical: 1.0,
-                        _padding: [0.0; 2],
-                    }),
-                    usage: bevy::render::render_resource::BufferUsages::UNIFORM,
-                },
-            );
-            dilate_v_bind_group = render_device.create_bind_group(
-                "jfa_dilate_v_bind_group",
-                &outline_pipeline.dilate_layout,
-                &BindGroupEntries::sequential((
-                    &mask_ping_view,
-                    &outline_pipeline.sampler,
-                    dilate_v_params.as_entire_binding(),
-                )),
-            );
-
-            // Init compute bind group: silhouette (read), mask (read), output (write)
+            // Init compute bind group: silhouette (read), output (write)
             init_bind_group = render_device.create_bind_group(
                 "jfa_init_compute_bind_group",
                 &outline_pipeline.init_layout,
                 &BindGroupEntries::sequential((
                     &silhouette_gpu.texture_view,
-                    &mask_pong_view, // Final mask after both dilation passes
-                    &ping_view,      // Output to JFA ping texture
+                    &ping_view, // Output to JFA ping texture
                 )),
             );
 
-            // Step compute bind groups - use actual_width for step sizes
+            // Step compute bind groups
             for pass_idx in 0..pass_count {
                 let step_size = (actual_width >> (pass_idx + 1)).max(1) as f32;
                 let read_from_ping = pass_idx % 2 == 0;
@@ -860,8 +683,7 @@ impl ViewNode for OutlineNode {
                     &outline_pipeline.step_layout,
                     &BindGroupEntries::sequential((
                         input_view,
-                        &mask_pong_view, // Final mask
-                        output_view,     // Output storage texture
+                        output_view, // Output storage texture
                         step_params_buffer.as_entire_binding(),
                     )),
                 );
@@ -879,47 +701,7 @@ impl ViewNode for OutlineNode {
             );
         }
 
-        // ========== Phase 2: Run all render passes ==========
-
-        // Dilate Horizontal: Expand silhouette horizontally
-        {
-            let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-                label: Some("jfa_dilate_h_pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &mask_ping_view,
-                    resolve_target: None,
-                    ops: Operations::default(),
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            render_pass.set_render_pipeline(dilate_pipeline);
-            render_pass.set_bind_group(0, &dilate_h_bind_group, &[]);
-            render_pass.draw(0..3, 0..1);
-        }
-
-        // Dilate Vertical: Expand mask vertically (creates final ROI mask)
-        {
-            let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-                label: Some("jfa_dilate_v_pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &mask_pong_view,
-                    resolve_target: None,
-                    ops: Operations::default(),
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            render_pass.set_render_pipeline(dilate_pipeline);
-            render_pass.set_bind_group(0, &dilate_v_bind_group, &[]);
-            render_pass.draw(0..3, 0..1);
-        }
+        // ========== Run compute passes ==========
 
         // Calculate workgroup count (8x8 workgroups)
         let tex_width = jfa_ping_gpu.texture.width();
