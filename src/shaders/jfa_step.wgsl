@@ -1,6 +1,7 @@
 // JFA Step Shader
 // One pass of the Jump Flood Algorithm
 // Samples 9 neighbors at step_size offset and propagates closest seed
+// Uses mask for early discard to skip pixels far from silhouette
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
@@ -13,6 +14,8 @@ struct JfaParams {
 };
 
 @group(0) @binding(2) var<uniform> params: JfaParams;
+@group(0) @binding(3) var mask_texture: texture_2d<f32>;
+@group(0) @binding(4) var mask_sampler: sampler;
 
 fn get_step_size() -> f32 {
     return params.data.x;
@@ -33,6 +36,12 @@ fn seed_distance_sq(pixel_uv: vec2<f32>, seed_uv: vec2<f32>, tex_size: vec2<f32>
 
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec2<f32> {
+    // Early discard if pixel is outside the region of interest
+    let mask = textureSample(mask_texture, mask_sampler, in.uv).r;
+    if mask < 0.5 {
+        return INVALID_SEED;
+    }
+
     let tex_size = vec2<f32>(textureDimensions(jfa_texture));
     let texel_size = 1.0 / tex_size;
     let step_offset = get_step_size() * texel_size;

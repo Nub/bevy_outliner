@@ -40,6 +40,7 @@
 
 mod components;
 mod jfa_material;
+mod silhouette_material;
 
 pub mod prelude {
     pub use crate::components::{MeshOutline, OutlineSettings};
@@ -54,6 +55,7 @@ use jfa_material::{
     resize_silhouette_textures, setup_outline_camera, sync_outline_meshes, sync_silhouette_cameras,
     OutlineRenderPlugin,
 };
+use silhouette_material::SilhouetteMaterial;
 
 /// Plugin that enables silhouette-based object outlining.
 pub struct OutlinePlugin;
@@ -63,9 +65,15 @@ impl Plugin for OutlinePlugin {
         // Embed shaders
         embedded_asset!(app, "shaders/jfa_init.wgsl");
         embedded_asset!(app, "shaders/jfa_step.wgsl");
+        embedded_asset!(app, "shaders/jfa_dilate.wgsl");
         embedded_asset!(app, "shaders/jfa_composite.wgsl");
+        embedded_asset!(app, "shaders/silhouette.wgsl");
 
-        app.add_plugins(OutlineRenderPlugin).add_systems(
+        app.add_plugins((
+            OutlineRenderPlugin,
+            MaterialPlugin::<SilhouetteMaterial>::default(),
+        ))
+        .add_systems(
             PostUpdate,
             (
                 setup_outline_camera,
