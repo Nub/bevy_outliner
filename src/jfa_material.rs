@@ -290,6 +290,8 @@ pub fn sync_outline_meshes(
     for entity in removed.read() {
         if let Ok((_, has_silhouette)) = sources_with_silhouettes.get(entity) {
             commands.entity(has_silhouette.silhouette).despawn();
+            // Remove HasSilhouetteMesh so outline can be re-added later
+            commands.entity(entity).remove::<HasSilhouetteMesh>();
         }
     }
 }
