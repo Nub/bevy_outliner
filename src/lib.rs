@@ -61,6 +61,8 @@ pub struct OutlinePlugin;
 impl Plugin for OutlinePlugin {
     fn build(&self, app: &mut App) {
         // Embed shaders
+        embedded_asset!(app, "shaders/jfa_init.wgsl");
+        embedded_asset!(app, "shaders/jfa_step.wgsl");
         embedded_asset!(app, "shaders/jfa_composite.wgsl");
 
         app.add_plugins(OutlineRenderPlugin).add_systems(

@@ -1,7 +1,4 @@
-use bevy::{
-    prelude::*,
-    render::{extract_component::ExtractComponent, render_resource::ShaderType},
-};
+use bevy::{prelude::*, render::extract_component::ExtractComponent};
 
 /// Component that marks an entity to be outlined.
 ///
@@ -83,28 +80,3 @@ impl OutlineSettings {
     }
 }
 
-/// GPU uniform for outline settings
-#[derive(Clone, Copy, ShaderType, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct OutlineUniforms {
-    pub color: [f32; 4],
-    pub width: f32,
-    pub step_size: f32,
-    pub _padding: [f32; 2],
-}
-
-impl From<&MeshOutline> for OutlineUniforms {
-    fn from(outline: &MeshOutline) -> Self {
-        Self {
-            color: [
-                outline.color.red,
-                outline.color.green,
-                outline.color.blue,
-                outline.color.alpha,
-            ],
-            width: outline.width,
-            step_size: 1.0,
-            _padding: [0.0; 2],
-        }
-    }
-}

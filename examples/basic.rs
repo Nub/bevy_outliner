@@ -2,12 +2,26 @@
 //!
 //! Run with: cargo run --example basic
 
-use bevy::prelude::*;
+use bevy::{
+    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    prelude::*,
+};
 use bevy_outliner::prelude::*;
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, OutlinePlugin))
+        .add_plugins((
+            DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    present_mode: bevy::window::PresentMode::AutoNoVsync,
+                    ..default()
+                }),
+                ..default()
+            }),
+            OutlinePlugin,
+            FrameTimeDiagnosticsPlugin::default(),
+            LogDiagnosticsPlugin::default(),
+        ))
         .add_systems(Startup, setup)
         .add_systems(Update, rotate_cubes)
         .run();

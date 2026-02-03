@@ -1,4 +1,9 @@
-//! JFA outline effect with custom render node for silhouette-based outlining.
+//! Multi-pass JFA outline effect with custom render nodes.
+//!
+//! Uses a true Jump Flood Algorithm for efficient distance field computation:
+//! 1. Init pass: Convert silhouette to seed coordinates
+//! 2. JFA passes: Propagate seeds with exponentially decreasing step sizes
+//! 3. Composite pass: Use distance field to render outline
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -11,13 +16,13 @@ use bevy::{
             NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
         },
         render_resource::{
-            binding_types::{sampler, texture_2d, uniform_buffer},
+            binding_types::{sampler as sampler_layout, texture_2d, uniform_buffer},
             BindGroupEntries, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
             CachedRenderPipelineId, ColorTargetState, ColorWrites, Extent3d, FragmentState,
             MultisampleState, Operations, PipelineCache, PrimitiveState, RenderPassColorAttachment,
             RenderPassDescriptor, RenderPipelineDescriptor, Sampler, SamplerBindingType,
             SamplerDescriptor, ShaderStages, ShaderType, TextureDimension, TextureFormat,
-            TextureSampleType, TextureUsages,
+            TextureSampleType, TextureUsages, TextureViewDescriptor,
         },
         renderer::{RenderContext, RenderDevice},
         texture::GpuImage,
@@ -41,25 +46,36 @@ pub struct OutlineShaderSettings {
     pub _padding: [f32; 2],
 }
 
-/// Links the main camera to its silhouette camera and texture
+/// GPU uniform for JFA step pass
+#[derive(Clone, Copy, Default, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct JfaStepParams {
+    pub step_size: f32,
+    pub _padding: [f32; 3],
+}
+
+/// Links the main camera to its silhouette camera and textures
 #[derive(Component, Clone)]
 pub struct OutlineCameraLink {
     pub silhouette_camera: Entity,
     pub silhouette_texture: Handle<Image>,
+    pub jfa_ping_texture: Handle<Image>,
+    pub jfa_pong_texture: Handle<Image>,
 }
 
 /// Extracted outline data for render world
 #[derive(Component, Clone)]
 pub struct ExtractedOutlineData {
     pub silhouette_texture: Handle<Image>,
+    pub jfa_ping_texture: Handle<Image>,
+    pub jfa_pong_texture: Handle<Image>,
     pub settings: OutlineShaderSettings,
+    pub max_width: u32,
 }
 
 /// Marker for silhouette cameras
 #[derive(Component)]
-pub struct SilhouetteCamera {
-    pub main_camera: Entity,
-}
+pub struct SilhouetteCamera;
 
 /// Marker for silhouette mesh copies
 #[derive(Component)]
@@ -70,6 +86,10 @@ pub struct SilhouetteMesh {
 /// Render label for the outline node
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 pub struct OutlineNodeLabel;
+
+/// Resource holding the white material for silhouettes
+#[derive(Resource, Clone)]
+pub struct SilhouetteWhiteMaterial(pub Handle<StandardMaterial>);
 
 /// System to set up silhouette camera for main cameras with OutlineSettings
 pub fn setup_outline_camera(
@@ -120,8 +140,36 @@ pub fn setup_outline_camera(
         );
         silhouette_image.texture_descriptor.usage =
             TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
-
         let silhouette_handle = images.add(silhouette_image);
+
+        // Create JFA ping-pong textures (RG16Float to store UV coordinates)
+        let jfa_extent = Extent3d {
+            width: size.x.max(1),
+            height: size.y.max(1),
+            depth_or_array_layers: 1,
+        };
+
+        let mut jfa_ping_image = Image::new_fill(
+            jfa_extent,
+            TextureDimension::D2,
+            &[0; 8], // 2 x f16 = 4 bytes, but new_fill expects 8 for Rg16Float
+            TextureFormat::Rg16Float,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        jfa_ping_image.texture_descriptor.usage =
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
+        let jfa_ping_handle = images.add(jfa_ping_image);
+
+        let mut jfa_pong_image = Image::new_fill(
+            jfa_extent,
+            TextureDimension::D2,
+            &[0; 8],
+            TextureFormat::Rg16Float,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        jfa_pong_image.texture_descriptor.usage =
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
+        let jfa_pong_handle = images.add(jfa_pong_image);
 
         // Create white material for silhouettes
         let white_material = materials.add(StandardMaterial {
@@ -146,21 +194,19 @@ pub fn setup_outline_camera(
                 *transform,
                 projection.clone(),
                 RenderLayers::layer(OUTLINE_RENDER_LAYER),
-                SilhouetteCamera { main_camera: entity },
+                SilhouetteCamera,
             ))
             .id();
 
-        // Link main camera to silhouette camera
+        // Link main camera to silhouette camera and textures
         commands.entity(entity).insert(OutlineCameraLink {
             silhouette_camera,
             silhouette_texture: silhouette_handle,
+            jfa_ping_texture: jfa_ping_handle,
+            jfa_pong_texture: jfa_pong_handle,
         });
     }
 }
-
-/// Resource holding the white material for silhouettes
-#[derive(Resource, Clone)]
-pub struct SilhouetteWhiteMaterial(pub Handle<StandardMaterial>);
 
 /// System to sync silhouette meshes with outlined entities
 pub fn sync_outline_meshes(
@@ -226,7 +272,7 @@ pub fn sync_silhouette_cameras(
     }
 }
 
-/// Resizes silhouette textures when the window size changes
+/// Resizes silhouette and JFA textures when the window size changes
 pub fn resize_silhouette_textures(
     mut images: ResMut<Assets<Image>>,
     cameras: Query<(Option<&RenderTarget>, &OutlineCameraLink), With<OutlineSettings>>,
@@ -260,24 +306,37 @@ pub fn resize_silhouette_textures(
             continue;
         }
 
-        // Check current silhouette texture size
-        let Some(silhouette_image) = images.get(&link.silhouette_texture) else {
-            continue;
+        let extent = Extent3d {
+            width: target_size.x,
+            height: target_size.y,
+            depth_or_array_layers: 1,
         };
 
-        let current_size = silhouette_image.size();
+        // Resize silhouette texture
+        if let Some(silhouette_image) = images.get(&link.silhouette_texture) {
+            if silhouette_image.size() != target_size {
+                if let Some(img) = images.get_mut(&link.silhouette_texture) {
+                    img.resize(extent);
+                }
+            }
+        }
 
-        // Resize if dimensions don't match
-        if current_size != target_size {
-            let Some(silhouette_image) = images.get_mut(&link.silhouette_texture) else {
-                continue;
-            };
+        // Resize JFA ping texture
+        if let Some(jfa_ping_image) = images.get(&link.jfa_ping_texture) {
+            if jfa_ping_image.size() != target_size {
+                if let Some(img) = images.get_mut(&link.jfa_ping_texture) {
+                    img.resize(extent);
+                }
+            }
+        }
 
-            silhouette_image.resize(Extent3d {
-                width: target_size.x,
-                height: target_size.y,
-                depth_or_array_layers: 1,
-            });
+        // Resize JFA pong texture
+        if let Some(jfa_pong_image) = images.get(&link.jfa_pong_texture) {
+            if jfa_pong_image.size() != target_size {
+                if let Some(img) = images.get_mut(&link.jfa_pong_texture) {
+                    img.resize(extent);
+                }
+            }
         }
     }
 }
@@ -309,12 +368,15 @@ pub fn extract_outline_data(
 
         commands.entity(render_entity.id()).insert(ExtractedOutlineData {
             silhouette_texture: link.silhouette_texture.clone(),
+            jfa_ping_texture: link.jfa_ping_texture.clone(),
+            jfa_pong_texture: link.jfa_pong_texture.clone(),
             settings: OutlineShaderSettings {
                 color,
                 width,
                 enabled: if settings.enabled { 1.0 } else { 0.0 },
                 _padding: [0.0; 2],
             },
+            max_width: settings.max_width,
         });
     }
 }
@@ -322,11 +384,20 @@ pub fn extract_outline_data(
 /// Pipeline resource for outline rendering
 #[derive(Resource)]
 pub struct OutlinePipeline {
-    pub layout: BindGroupLayout,
-    pub layout_descriptor: BindGroupLayoutDescriptor,
+    // Init pass
+    pub init_layout: BindGroupLayout,
+    pub init_pipeline_id: CachedRenderPipelineId,
+
+    // JFA step pass
+    pub step_layout: BindGroupLayout,
+    pub step_pipeline_id: CachedRenderPipelineId,
+
+    // Composite pass
+    pub composite_layout: BindGroupLayout,
+    pub composite_pipeline_id: CachedRenderPipelineId,
+    pub composite_pipeline_id_hdr: CachedRenderPipelineId,
+
     pub sampler: Sampler,
-    pub pipeline_id: CachedRenderPipelineId,
-    pub pipeline_id_hdr: CachedRenderPipelineId,
 }
 
 impl FromWorld for OutlinePipeline {
@@ -335,40 +406,38 @@ impl FromWorld for OutlinePipeline {
         let asset_server = world.resource::<AssetServer>();
         let pipeline_cache = world.resource::<PipelineCache>();
 
-        let layout_descriptor = BindGroupLayoutDescriptor::new(
-            "outline_bind_group_layout",
-            &BindGroupLayoutEntries::sequential(
-                ShaderStages::FRAGMENT,
-                (
-                    // Scene texture
-                    texture_2d(TextureSampleType::Float { filterable: true }),
-                    // Scene sampler
-                    sampler(SamplerBindingType::Filtering),
-                    // Silhouette texture
-                    texture_2d(TextureSampleType::Float { filterable: true }),
-                    // Silhouette sampler
-                    sampler(SamplerBindingType::Filtering),
-                    // Settings uniform (non-dynamic)
-                    uniform_buffer::<OutlineShaderSettings>(false),
-                ),
+        let sampler = render_device.create_sampler(&SamplerDescriptor::default());
+
+        // Shaders
+        let vertex_shader = asset_server
+            .load("embedded://bevy_core_pipeline/fullscreen_vertex_shader/fullscreen.wgsl");
+        let init_shader = asset_server.load("embedded://bevy_outliner/shaders/jfa_init.wgsl");
+        let step_shader = asset_server.load("embedded://bevy_outliner/shaders/jfa_step.wgsl");
+        let composite_shader =
+            asset_server.load("embedded://bevy_outliner/shaders/jfa_composite.wgsl");
+
+        // ========== Init Pipeline ==========
+        let init_layout_entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // Silhouette texture
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                // Silhouette sampler
+                sampler_layout(SamplerBindingType::Filtering),
             ),
         );
 
-        let layout = render_device.create_bind_group_layout(
-            Some("outline_bind_group_layout"),
-            &layout_descriptor.entries,
+        let init_layout = render_device.create_bind_group_layout(
+            Some("jfa_init_bind_group_layout"),
+            &init_layout_entries,
         );
 
-        let sampler = render_device.create_sampler(&SamplerDescriptor::default());
-
-        let shader = asset_server.load("embedded://bevy_outliner/shaders/jfa_composite.wgsl");
-
-        let vertex_shader = asset_server
-            .load("embedded://bevy_core_pipeline/fullscreen_vertex_shader/fullscreen.wgsl");
-
-        let pipeline_desc = RenderPipelineDescriptor {
-            label: Some("outline_pipeline".into()),
-            layout: vec![layout_descriptor.clone()],
+        let init_pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("jfa_init_pipeline".into()),
+            layout: vec![BindGroupLayoutDescriptor::new(
+                "jfa_init_bind_group_layout",
+                &init_layout_entries,
+            )],
             vertex: bevy::render::render_resource::VertexState {
                 shader: vertex_shader.clone(),
                 shader_defs: vec![],
@@ -376,11 +445,11 @@ impl FromWorld for OutlinePipeline {
                 buffers: vec![],
             },
             fragment: Some(FragmentState {
-                shader,
+                shader: init_shader,
                 shader_defs: vec![],
                 entry_point: Some("fragment".into()),
                 targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::bevy_default(),
+                    format: TextureFormat::Rg16Float,
                     blend: None,
                     write_mask: ColorWrites::ALL,
                 })],
@@ -390,28 +459,154 @@ impl FromWorld for OutlinePipeline {
             multisample: MultisampleState::default(),
             push_constant_ranges: vec![],
             zero_initialize_workgroup_memory: false,
-        };
+        });
 
-        let pipeline_id = pipeline_cache.queue_render_pipeline(pipeline_desc.clone());
+        // ========== Step Pipeline ==========
+        let step_layout_entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // JFA input texture
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                // JFA sampler
+                sampler_layout(SamplerBindingType::Filtering),
+                // Step params uniform
+                uniform_buffer::<JfaStepParams>(false),
+            ),
+        );
 
-        let mut hdr_desc = pipeline_desc;
-        hdr_desc.fragment.as_mut().unwrap().targets[0]
-            .as_mut()
-            .unwrap()
-            .format = ViewTarget::TEXTURE_FORMAT_HDR;
-        let pipeline_id_hdr = pipeline_cache.queue_render_pipeline(hdr_desc);
+        let step_layout = render_device.create_bind_group_layout(
+            Some("jfa_step_bind_group_layout"),
+            &step_layout_entries,
+        );
+
+        let step_pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("jfa_step_pipeline".into()),
+            layout: vec![BindGroupLayoutDescriptor::new(
+                "jfa_step_bind_group_layout",
+                &step_layout_entries,
+            )],
+            vertex: bevy::render::render_resource::VertexState {
+                shader: vertex_shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("fullscreen_vertex_shader".into()),
+                buffers: vec![],
+            },
+            fragment: Some(FragmentState {
+                shader: step_shader,
+                shader_defs: vec![],
+                entry_point: Some("fragment".into()),
+                targets: vec![Some(ColorTargetState {
+                    format: TextureFormat::Rg16Float,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            push_constant_ranges: vec![],
+            zero_initialize_workgroup_memory: false,
+        });
+
+        // ========== Composite Pipeline ==========
+        let composite_layout_entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // Scene texture
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                // Scene sampler
+                sampler_layout(SamplerBindingType::Filtering),
+                // JFA result texture
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                // JFA sampler
+                sampler_layout(SamplerBindingType::Filtering),
+                // Silhouette texture
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                // Silhouette sampler
+                sampler_layout(SamplerBindingType::Filtering),
+                // Settings uniform
+                uniform_buffer::<OutlineShaderSettings>(false),
+            ),
+        );
+
+        let composite_layout = render_device.create_bind_group_layout(
+            Some("jfa_composite_bind_group_layout"),
+            &composite_layout_entries,
+        );
+
+        let composite_layout_desc = BindGroupLayoutDescriptor::new(
+            "jfa_composite_bind_group_layout",
+            &composite_layout_entries,
+        );
+
+        let composite_pipeline_id =
+            pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+                label: Some("jfa_composite_pipeline".into()),
+                layout: vec![composite_layout_desc.clone()],
+                vertex: bevy::render::render_resource::VertexState {
+                    shader: vertex_shader.clone(),
+                    shader_defs: vec![],
+                    entry_point: Some("fullscreen_vertex_shader".into()),
+                    buffers: vec![],
+                },
+                fragment: Some(FragmentState {
+                    shader: composite_shader.clone(),
+                    shader_defs: vec![],
+                    entry_point: Some("fragment".into()),
+                    targets: vec![Some(ColorTargetState {
+                        format: TextureFormat::bevy_default(),
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                push_constant_ranges: vec![],
+                zero_initialize_workgroup_memory: false,
+            });
+
+        let composite_pipeline_id_hdr =
+            pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+                label: Some("jfa_composite_pipeline_hdr".into()),
+                layout: vec![composite_layout_desc],
+                vertex: bevy::render::render_resource::VertexState {
+                    shader: vertex_shader,
+                    shader_defs: vec![],
+                    entry_point: Some("fullscreen_vertex_shader".into()),
+                    buffers: vec![],
+                },
+                fragment: Some(FragmentState {
+                    shader: composite_shader,
+                    shader_defs: vec![],
+                    entry_point: Some("fragment".into()),
+                    targets: vec![Some(ColorTargetState {
+                        format: ViewTarget::TEXTURE_FORMAT_HDR,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                push_constant_ranges: vec![],
+                zero_initialize_workgroup_memory: false,
+            });
 
         Self {
-            layout,
-            layout_descriptor,
+            init_layout,
+            init_pipeline_id,
+            step_layout,
+            step_pipeline_id,
+            composite_layout,
+            composite_pipeline_id,
+            composite_pipeline_id_hdr,
             sampler,
-            pipeline_id,
-            pipeline_id_hdr,
         }
     }
 }
 
-/// The outline render node
+/// The outline render node - runs JFA passes and composites the result
 #[derive(Default)]
 pub struct OutlineNode;
 
@@ -433,62 +628,202 @@ impl ViewNode for OutlineNode {
         let pipeline_cache = world.resource::<PipelineCache>();
         let gpu_images = world.resource::<RenderAssets<GpuImage>>();
 
-        // Get the silhouette texture
-        let Some(silhouette_gpu_image) = gpu_images.get(&outline_data.silhouette_texture) else {
+        // Get all required textures
+        let Some(silhouette_gpu) = gpu_images.get(&outline_data.silhouette_texture) else {
+            return Ok(());
+        };
+        let Some(jfa_ping_gpu) = gpu_images.get(&outline_data.jfa_ping_texture) else {
+            return Ok(());
+        };
+        let Some(jfa_pong_gpu) = gpu_images.get(&outline_data.jfa_pong_texture) else {
             return Ok(());
         };
 
-        // Get the correct pipeline
-        let pipeline_id = if view_target.is_hdr() {
-            outline_pipeline.pipeline_id_hdr
+        // Get pipelines
+        let Some(init_pipeline) = pipeline_cache.get_render_pipeline(outline_pipeline.init_pipeline_id) else {
+            return Ok(());
+        };
+        let Some(step_pipeline) = pipeline_cache.get_render_pipeline(outline_pipeline.step_pipeline_id) else {
+            return Ok(());
+        };
+
+        let composite_pipeline_id = if view_target.is_hdr() {
+            outline_pipeline.composite_pipeline_id_hdr
         } else {
-            outline_pipeline.pipeline_id
+            outline_pipeline.composite_pipeline_id
         };
-
-        let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
+        let Some(composite_pipeline) = pipeline_cache.get_render_pipeline(composite_pipeline_id) else {
             return Ok(());
         };
 
-        // Create settings buffer
-        let settings_buffer = render_context
-            .render_device()
-            .create_buffer_with_data(&bevy::render::render_resource::BufferInitDescriptor {
-                label: Some("outline_settings_buffer"),
-                contents: bytemuck::bytes_of(&outline_data.settings),
-                usage: bevy::render::render_resource::BufferUsages::UNIFORM,
+        // Create texture views for ping-pong
+        let ping_view = jfa_ping_gpu.texture.create_view(&TextureViewDescriptor::default());
+        let pong_view = jfa_pong_gpu.texture.create_view(&TextureViewDescriptor::default());
+
+        // Calculate pass count upfront
+        let pass_count = if outline_data.max_width > 0 {
+            ((outline_data.max_width as f32).log2().ceil() as u32).max(1)
+        } else {
+            0
+        };
+
+        // ========== Phase 1: Create all resources upfront ==========
+        // This avoids borrow conflicts between render_device and render_context
+
+        let init_bind_group;
+        let mut step_bind_groups = Vec::with_capacity(pass_count as usize);
+        let settings_buffer;
+
+        {
+            let render_device = render_context.render_device();
+
+            // Init bind group
+            init_bind_group = render_device.create_bind_group(
+                "jfa_init_bind_group",
+                &outline_pipeline.init_layout,
+                &BindGroupEntries::sequential((
+                    &silhouette_gpu.texture_view,
+                    &outline_pipeline.sampler,
+                )),
+            );
+
+            // Step bind groups - we need to pre-create all of them
+            // Note: we can't reference ping_view/pong_view directly in bind groups
+            // because we need to alternate. We'll create bind groups for both directions.
+            for pass_idx in 0..pass_count {
+                let step_size = (outline_data.max_width >> (pass_idx + 1)).max(1) as f32;
+                let read_from_ping = pass_idx % 2 == 0;
+
+                let input_view = if read_from_ping {
+                    &ping_view
+                } else {
+                    &pong_view
+                };
+
+                let step_params_buffer = render_device.create_buffer_with_data(
+                    &bevy::render::render_resource::BufferInitDescriptor {
+                        label: Some("jfa_step_params_buffer"),
+                        contents: bytemuck::bytes_of(&JfaStepParams {
+                            step_size,
+                            _padding: [0.0; 3],
+                        }),
+                        usage: bevy::render::render_resource::BufferUsages::UNIFORM,
+                    },
+                );
+
+                let step_bind_group = render_device.create_bind_group(
+                    "jfa_step_bind_group",
+                    &outline_pipeline.step_layout,
+                    &BindGroupEntries::sequential((
+                        input_view,
+                        &outline_pipeline.sampler,
+                        step_params_buffer.as_entire_binding(),
+                    )),
+                );
+
+                step_bind_groups.push((step_bind_group, read_from_ping));
+            }
+
+            // Settings buffer for composite
+            settings_buffer = render_device.create_buffer_with_data(
+                &bevy::render::render_resource::BufferInitDescriptor {
+                    label: Some("outline_settings_buffer"),
+                    contents: bytemuck::bytes_of(&outline_data.settings),
+                    usage: bevy::render::render_resource::BufferUsages::UNIFORM,
+                },
+            );
+        }
+
+        // ========== Phase 2: Run all render passes ==========
+
+        // Init Pass: Convert silhouette to seed coordinates
+        {
+            let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("jfa_init_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &ping_view,
+                    resolve_target: None,
+                    ops: Operations::default(),
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
             });
 
-        let post_process = view_target.post_process_write();
+            render_pass.set_render_pipeline(init_pipeline);
+            render_pass.set_bind_group(0, &init_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
 
-        // Create bind group
-        let bind_group = render_context.render_device().create_bind_group(
-            "outline_bind_group",
-            &outline_pipeline.layout,
-            &BindGroupEntries::sequential((
-                post_process.source,
-                &outline_pipeline.sampler,
-                &silhouette_gpu_image.texture_view,
-                &outline_pipeline.sampler,
-                settings_buffer.as_entire_binding(),
-            )),
-        );
+        // JFA Step Passes: Propagate seeds with decreasing step sizes
+        for (step_bind_group, read_from_ping) in &step_bind_groups {
+            let output_view = if *read_from_ping {
+                &pong_view
+            } else {
+                &ping_view
+            };
 
-        let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("outline_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: post_process.destination,
-                resolve_target: None,
-                ops: Operations::default(),
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
+            let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("jfa_step_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: output_view,
+                    resolve_target: None,
+                    ops: Operations::default(),
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
 
-        render_pass.set_render_pipeline(pipeline);
-        render_pass.set_bind_group(0, &bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
+            render_pass.set_render_pipeline(step_pipeline);
+            render_pass.set_bind_group(0, step_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        // Determine which texture has the final JFA result
+        let jfa_result_view = if pass_count % 2 == 0 {
+            &ping_view
+        } else {
+            &pong_view
+        };
+
+        // Composite Pass: Blend outline over scene using JFA distance field
+        {
+            let post_process = view_target.post_process_write();
+
+            let composite_bind_group = render_context.render_device().create_bind_group(
+                "jfa_composite_bind_group",
+                &outline_pipeline.composite_layout,
+                &BindGroupEntries::sequential((
+                    post_process.source,
+                    &outline_pipeline.sampler,
+                    jfa_result_view,
+                    &outline_pipeline.sampler,
+                    &silhouette_gpu.texture_view,
+                    &outline_pipeline.sampler,
+                    settings_buffer.as_entire_binding(),
+                )),
+            );
+
+            let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("jfa_composite_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: post_process.destination,
+                    resolve_target: None,
+                    ops: Operations::default(),
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            render_pass.set_render_pipeline(composite_pipeline);
+            render_pass.set_bind_group(0, &composite_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
 
         Ok(())
     }
